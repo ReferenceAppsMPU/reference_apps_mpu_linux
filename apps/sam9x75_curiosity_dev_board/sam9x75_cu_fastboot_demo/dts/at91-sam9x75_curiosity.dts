@@ -502,14 +502,6 @@
 	clock-frequency = <32768>;
 };
 
-&shutdown_controller {
-	debounce-delay-us = <976>;
-	status = "okay";
-
-	input@0 {
-		reg = <0>;
-	};
-};
 
 &trng {
 	status = "okay";
