@@ -1,0 +1,956 @@
+diff --git a/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts b/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
+index da5d83607a77..5b912c8805ed 100644
+--- a/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
++++ b/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
+@@ -213,6 +213,11 @@ channel@4 {
+ 	pmic@5b {
+ 		compatible = "microchip,mcp16502";
+ 		reg = <0x5b>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_mcp16502_default>;
++		interrupt-parent = <&pioa>;
++		interrupts = <PIN_PC2 IRQ_TYPE_EDGE_FALLING>;
++		irq-capture-nstart;
+ 
+ 		regulators {
+ 			vdd_3v3: VDD_IO {
+@@ -600,6 +605,13 @@ pinctrl_usbc_vbus_en: usbc-vbus-en {
+ 		pinmux = <PIN_PC21__GPIO>;
+ 		bias-disable;
+ 	};
++
++	pinctrl_mcp16502_default: mcp16502_default {
++		int {
++			pinmux = <PIN_PC2__GPIO>;
++			bias-pull-up;
++		};
++	};
+ };
+ 
+ &qspi0 {
+diff --git a/arch/arm/kernel/Makefile b/arch/arm/kernel/Makefile
+index aaae31b8c4a5..c0cdd47259af 100644
+--- a/arch/arm/kernel/Makefile
++++ b/arch/arm/kernel/Makefile
+@@ -5,6 +5,7 @@
+ 
+ CPPFLAGS_vmlinux.lds := -DTEXT_OFFSET=$(TEXT_OFFSET)
+ AFLAGS_head.o        := -DTEXT_OFFSET=$(TEXT_OFFSET)
++AFLAGS_sleep.o        := -DTEXT_OFFSET=$(TEXT_OFFSET)
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+ CFLAGS_REMOVE_ftrace.o = -pg
+diff --git a/arch/arm/kernel/sleep.S b/arch/arm/kernel/sleep.S
+index 93afd1005b43..823b215f994e 100644
+--- a/arch/arm/kernel/sleep.S
++++ b/arch/arm/kernel/sleep.S
+@@ -7,6 +7,13 @@
+ #include <asm/glue-proc.h>
+ 	.text
+ 
++#ifdef CONFIG_ARM_LPAE
++    /* LPAE requires an additional page for the PGD */
++#define PG_DIR_SIZE 0x5000
++#else
++#define PG_DIR_SIZE 0x4000
++#endif
++
+ /*
+  * Implementation of MPIDR hash algorithm through shifting
+  * and OR'ing.
+@@ -109,6 +116,12 @@ ENDPROC(cpu_suspend_abort)
+ 	.pushsection	.idmap.text,"ax"
+ ENTRY(cpu_resume_mmu)
+ 	ldr	r3, =cpu_resume_after_mmu
++#if __LINUX_ARM_ARCH__ <= 5
++	adr_l   ip, _text			@ __pa(_text)
++	sub ip, ip, #TEXT_OFFSET	@ PHYS_OFFSET
++	add ip, ip, #TEXT_OFFSET
++	sub ip, ip, #PG_DIR_SIZE
++#endif
+ 	instr_sync
+ 	mcr	p15, 0, r0, c1, c0, 0	@ turn on MMU, I-cache, etc
+ 	mrc	p15, 0, r0, c0, c0, 0	@ read id reg
+@@ -122,7 +135,9 @@ cpu_resume_after_mmu:
+ #if defined(CONFIG_VMAP_STACK) && !defined(CONFIG_ARM_LPAE)
+ 	@ Before using the vmap'ed stack, we have to switch to swapper_pg_dir
+ 	@ as the ID map does not cover the vmalloc region.
++#if __LINUX_ARM_ARCH__ > 5
+ 	mrc	p15, 0, ip, c2, c0, 1	@ read TTBR1
++#endif
+ 	mcr	p15, 0, ip, c2, c0, 0	@ set TTBR0
+ 	instr_sync
+ #endif
+diff --git a/arch/arm/mach-at91/pm.c b/arch/arm/mach-at91/pm.c
+index e90c45255123..515ed5a1a2c2 100644
+--- a/arch/arm/mach-at91/pm.c
++++ b/arch/arm/mach-at91/pm.c
+@@ -31,6 +31,15 @@
+ 
+ #define BACKUP_DDR_PHY_CALIBRATION	(9)
+ 
++enum ver_id {
++	ID_0_VER_5_15_68,
++	ID_1_VER_6_6_23,
++	ID_2_VER_6_6_51,
++	ID_3_VER_6_10_14,
++	ID_4_VER_6_12_22,
++	ID_5_VER_6_12_48,
++};
++
+ /**
+  * struct at91_pm_bu - AT91 power management backup unit data structure
+  * @suspended: true if suspended to backup mode
+@@ -42,10 +51,21 @@
+  */
+ struct at91_pm_bu {
+ 	int suspended;
++#define SUS_NONE    0
++#define SUS_BACKUP  1
++#define SUS_RESTORE 2
+ 	unsigned long reserved;
+ 	phys_addr_t canary;
+ 	phys_addr_t resume;
+ 	unsigned long ddr_phy_calibration[BACKUP_DDR_PHY_CALIBRATION];
++	phys_addr_t res_mem_map;
++	unsigned long res_max_mapnr;
++	unsigned long res_struct_size;
++	unsigned long res_page_shift;
++	unsigned long res_pagetype;
++	unsigned long res_pagetype_off;
++	unsigned long res_order_off;
++	unsigned long res_linux_ver;
+ };
+ 
+ /**
+@@ -143,6 +163,7 @@ struct at91_soc_pm {
+  */
+ enum at91_pm_iomaps {
+ 	AT91_PM_IOMAP_SHDWC,
++	AT91_PM_IOMAP_RSTC,
+ 	AT91_PM_IOMAP_SFRBU,
+ 	AT91_PM_IOMAP_ETHC,
+ };
+@@ -162,6 +183,8 @@ static const match_table_t pm_modes __initconst = {
+ 	{ AT91_PM_ULP0_FAST,    "ulp0-fast" },
+ 	{ AT91_PM_ULP1,		"ulp1" },
+ 	{ AT91_PM_BACKUP,	"backup" },
++	{ AT91_PM_RESTORE,	"restore" },
++	{ AT91_PM_SNAPSHOT,	"snapshot" },
+ 	{ -1, NULL },
+ };
+ 
+@@ -570,10 +593,25 @@ static int at91_pm_begin(suspend_state_t state)
+ 		return ret;
+ 	}
+ 
+-	if (soc_pm.data.mode == AT91_PM_BACKUP)
+-		soc_pm.bu->suspended = 1;
+-	else if (soc_pm.bu)
+-		soc_pm.bu->suspended = 0;
++	if (soc_pm.data.mode == AT91_PM_BACKUP) {
++		soc_pm.bu->suspended = SUS_BACKUP;
++		soc_pm.bu->canary    = __pa_symbol(&canary);
++		soc_pm.bu->resume    = __pa_symbol(cpu_resume);
++	} else if (soc_pm.data.mode == AT91_PM_RESTORE) {
++		soc_pm.bu->suspended        = SUS_RESTORE;
++		soc_pm.bu->canary           = __pa_symbol(&canary);
++		soc_pm.bu->resume           = __pa_symbol(cpu_resume);
++		soc_pm.bu->res_mem_map      = __pa_symbol(mem_map);
++		soc_pm.bu->res_max_mapnr    = max_mapnr;
++		soc_pm.bu->res_struct_size  = sizeof(struct page);
++		soc_pm.bu->res_page_shift   = PAGE_SHIFT;
++		soc_pm.bu->res_pagetype     = PGTY_buddy;
++		soc_pm.bu->res_pagetype_off = offsetof(struct page, page_type);
++		soc_pm.bu->res_order_off    = offsetof(struct page, private);
++		soc_pm.bu->res_linux_ver    = ID_5_VER_6_12_48;
++	} else if (soc_pm.bu) {
++		soc_pm.bu->suspended = SUS_NONE;
++	}
+ 
+ 	return 0;
+ }
+@@ -643,7 +681,8 @@ static int at91_suspend_finish(unsigned long val)
+ 	unsigned int tmp, index;
+ 	int i;
+ 
+-	if (soc_pm.data.mode == AT91_PM_BACKUP && soc_pm.data.ramc_phy) {
++	if (((soc_pm.data.mode == AT91_PM_BACKUP) || (soc_pm.data.mode == AT91_PM_RESTORE))
++	    && soc_pm.data.ramc_phy) {
+ 		/*
+ 		 * Bootloader will perform DDR recalibration and will try to
+ 		 * restore the ZQ0SR0 with the value saved here. But the
+@@ -723,7 +762,9 @@ static void at91_pm_switch_ba_to_auto(void)
+ 
+ static void at91_pm_suspend(suspend_state_t state)
+ {
+-	if (soc_pm.data.mode == AT91_PM_BACKUP) {
++	if ((soc_pm.data.mode == AT91_PM_BACKUP) ||
++		(soc_pm.data.mode == AT91_PM_RESTORE) ||
++		(soc_pm.data.mode == AT91_PM_SNAPSHOT)) {
+ 		at91_pm_switch_ba_to_auto();
+ 
+ 		cpu_suspend(0, at91_suspend_finish);
+@@ -1154,10 +1195,27 @@ static int __init at91_pm_backup_init(void)
+ 
+ 	if (!IS_ENABLED(CONFIG_SOC_SAMA5D2) &&
+ 	    !IS_ENABLED(CONFIG_SOC_SAMA7G5) &&
+-	    !IS_ENABLED(CONFIG_SOC_SAMA7D65))
++	    !IS_ENABLED(CONFIG_SOC_SAMA7D65) &&
++	    !IS_ENABLED(CONFIG_SOC_SAM9X7) &&
++	    !IS_ENABLED(CONFIG_SOC_SAM9X60))
+ 		return -EPERM;
+ 
+-	if (!at91_is_pm_mode_active(AT91_PM_BACKUP))
++
++	if (at91_is_pm_mode_active(AT91_PM_SNAPSHOT)) {
++		pr_info("AT91: PM: canary      = 0x%x\n\r", __pa_symbol(&canary));
++		pr_info("AT91: PM: resume      = 0x%x\n\r", __pa_symbol(cpu_resume));
++		pr_info("AT91: PM: mem_map     = 0x%x\n\r", __pa_symbol(mem_map));
++		pr_info("AT91: PM: max_mapnr   = 0x%lx\n\r", max_mapnr);
++		pr_info("AT91: PM: struct_size = 0x%x\n\r", sizeof(struct page));
++		pr_info("AT91: PM: page_shift  = 0x%x\n\r", PAGE_SHIFT);
++		pr_info("AT91: PM: page_type   = 0x%x\n\r", PGTY_buddy);
++		pr_info("AT91: PM: page_off    = 0x%x\n\r", offsetof(struct page, page_type));
++		pr_info("AT91: PM: order_off   = 0x%x\n\r", offsetof(struct page, private));
++		pr_info("AT91: PM: linux_ver   = 0x%x\n\r", ID_5_VER_6_12_48);
++	}
++
++	if (!at91_is_pm_mode_active(AT91_PM_BACKUP) &&
++	    !at91_is_pm_mode_active(AT91_PM_RESTORE))
+ 		return 0;
+ 
+ 	np = of_find_compatible_node(NULL, NULL, "atmel,sama5d2-securam");
+@@ -1184,7 +1242,7 @@ static int __init at91_pm_backup_init(void)
+ 		goto securam_fail;
+ 	}
+ 
+-	soc_pm.bu->suspended = 0;
++	soc_pm.bu->suspended = SUS_NONE;
+ 	soc_pm.bu->canary = __pa_symbol(&canary);
+ 	soc_pm.bu->resume = __pa_symbol(cpu_resume);
+ 	if (soc_pm.data.ramc_phy) {
+@@ -1239,6 +1297,12 @@ static const struct of_device_id atmel_shdwc_ids[] = {
+ 	{ /* sentinel. */ }
+ };
+ 
++static const struct of_device_id atmel_rstc_ids[] = {
++	{ .compatible = "microchip,sama7g5-rstc" },
++	{ .compatible = "atmel,sama5d3-rstc" },
++	{ }
++};
++
+ static const struct of_device_id gmac_ids[] __initconst = {
+ 	{ .compatible = "atmel,sama5d3-gem" },
+ 	{ .compatible = "atmel,sama5d2-gem" },
+@@ -1341,6 +1405,9 @@ static void __init at91_pm_modes_init(const u32 *maps, int len)
+ 			soc_pm.data.suspend_mode = AT91_PM_ULP0;
+ 	}
+ 
++	if (!maps || !len)
++		return;
++
+ 	if (maps[soc_pm.data.standby_mode] & AT91_PM_IOMAP(SHDWC) ||
+ 	    maps[soc_pm.data.suspend_mode] & AT91_PM_IOMAP(SHDWC)) {
+ 		np = of_find_matching_node(NULL, atmel_shdwc_ids);
+@@ -1357,6 +1424,18 @@ static void __init at91_pm_modes_init(const u32 *maps, int len)
+ 		}
+ 	}
+ 
++	if (maps[soc_pm.data.standby_mode] & AT91_PM_IOMAP(RSTC) ||
++	    maps[soc_pm.data.suspend_mode] & AT91_PM_IOMAP(RSTC)) {
++		np = of_find_matching_node(NULL, atmel_rstc_ids);
++		if (!np) {
++			pr_warn("%s: failed to find rstc!\n", __func__);
++			AT91_PM_REPLACE_MODES(maps, RSTC);
++		} else {
++			soc_pm.data.rstc = of_iomap(np, 0);
++			of_node_put(np);
++		}
++	}
++
+ 	if (maps[soc_pm.data.standby_mode] & AT91_PM_IOMAP(SFRBU) ||
+ 	    maps[soc_pm.data.suspend_mode] & AT91_PM_IOMAP(SFRBU)) {
+ 		np = of_find_compatible_node(NULL, NULL, "atmel,sama5d2-sfrbu");
+@@ -1614,6 +1693,7 @@ void __init sam9x60_pm_init(void)
+ {
+ 	static const int modes[] __initconst = {
+ 		AT91_PM_STANDBY, AT91_PM_ULP0, AT91_PM_ULP0_FAST, AT91_PM_ULP1,
++		AT91_PM_SNAPSHOT,
+ 	};
+ 	static const int iomaps[] __initconst = {
+ 		[AT91_PM_ULP1]		= AT91_PM_IOMAP(SHDWC),
+@@ -1639,6 +1719,7 @@ void __init sam9x7_pm_init(void)
+ {
+ 	static const int modes[] __initconst = {
+ 		AT91_PM_STANDBY, AT91_PM_ULP0,
++		AT91_PM_SNAPSHOT,
+ 	};
+ 	int ret;
+ 
+@@ -1646,6 +1727,7 @@ void __init sam9x7_pm_init(void)
+ 		return;
+ 
+ 	at91_pm_modes_validate(modes, ARRAY_SIZE(modes));
++	at91_pm_modes_init(NULL, 0);
+ 	ret = at91_dt_ramc(false);
+ 	if (ret)
+ 		return;
+@@ -1713,7 +1795,7 @@ void __init sama5d2_pm_init(void)
+ {
+ 	static const int modes[] __initconst = {
+ 		AT91_PM_STANDBY, AT91_PM_ULP0, AT91_PM_ULP0_FAST, AT91_PM_ULP1,
+-		AT91_PM_BACKUP,
++		AT91_PM_BACKUP, AT91_PM_RESTORE, AT91_PM_SNAPSHOT,
+ 	};
+ 	static const u32 iomaps[] __initconst = {
+ 		[AT91_PM_ULP0]		= AT91_PM_IOMAP(ETHC),
+@@ -1722,6 +1804,8 @@ void __init sama5d2_pm_init(void)
+ 					  AT91_PM_IOMAP(ETHC),
+ 		[AT91_PM_BACKUP]	= AT91_PM_IOMAP(SHDWC) |
+ 					  AT91_PM_IOMAP(SFRBU),
++		[AT91_PM_RESTORE]	= AT91_PM_IOMAP(RSTC) |
++					  AT91_PM_IOMAP(SFRBU),
+ 	};
+ 	int ret;
+ 
+@@ -1767,6 +1851,7 @@ void __init sama7_pm_init(void)
+ {
+ 	static const int modes[] __initconst = {
+ 		AT91_PM_STANDBY, AT91_PM_ULP0, AT91_PM_ULP1, AT91_PM_BACKUP,
++		AT91_PM_RESTORE, AT91_PM_SNAPSHOT,
+ 	};
+ 	static const u32 iomaps[] __initconst = {
+ 		[AT91_PM_ULP0]		= AT91_PM_IOMAP(SFRBU) |
+@@ -1776,6 +1861,10 @@ void __init sama7_pm_init(void)
+ 					  AT91_PM_IOMAP(ETHC),
+ 		[AT91_PM_BACKUP]	= AT91_PM_IOMAP(SFRBU) |
+ 					  AT91_PM_IOMAP(SHDWC),
++		[AT91_PM_RESTORE]	= AT91_PM_IOMAP(SHDWC) |
++					  AT91_PM_IOMAP(RSTC) |
++					  AT91_PM_IOMAP(SFRBU),
++		[AT91_PM_SNAPSHOT]	= AT91_PM_IOMAP(SHDWC),
+ 	};
+ 	int ret;
+ 
+diff --git a/arch/arm/mach-at91/pm.h b/arch/arm/mach-at91/pm.h
+index 4879ed8e9c7f..4aaa1939c5fd 100644
+--- a/arch/arm/mach-at91/pm.h
++++ b/arch/arm/mach-at91/pm.h
+@@ -24,6 +24,9 @@
+ #define AT91_PM_ULP0_FAST	0x02
+ #define AT91_PM_ULP1		0x03
+ #define	AT91_PM_BACKUP		0x04
++#define AT91_PM_RESTORE		0x05
++#define AT91_PM_SNAPSHOT	0x06
++#define AT91_PM_MAX		0x07
+ 
+ #ifndef __ASSEMBLY__
+ struct at91_pm_data {
+@@ -34,6 +37,7 @@ struct at91_pm_data {
+ 	unsigned int memctrl;
+ 	unsigned int mode;
+ 	void __iomem *shdwc;
++	void __iomem *rstc;
+ 	void __iomem *sfrbu;
+ 	unsigned int standby_mode;
+ 	unsigned int suspend_mode;
+diff --git a/arch/arm/mach-at91/pm_data-offsets.c b/arch/arm/mach-at91/pm_data-offsets.c
+index d9ba2b7d5f3a..63b06a1b86af 100644
+--- a/arch/arm/mach-at91/pm_data-offsets.c
++++ b/arch/arm/mach-at91/pm_data-offsets.c
+@@ -13,6 +13,7 @@ int main(void)
+ 	DEFINE(PM_DATA_MEMCTRL,	offsetof(struct at91_pm_data, memctrl));
+ 	DEFINE(PM_DATA_MODE,		offsetof(struct at91_pm_data, mode));
+ 	DEFINE(PM_DATA_SHDWC,		offsetof(struct at91_pm_data, shdwc));
++	DEFINE(PM_DATA_RSTC,		offsetof(struct at91_pm_data, rstc));
+ 	DEFINE(PM_DATA_SFRBU,		offsetof(struct at91_pm_data, sfrbu));
+ 	DEFINE(PM_DATA_PMC_MCKR_OFFSET,	offsetof(struct at91_pm_data,
+ 						 pmc_mckr_offset));
+diff --git a/arch/arm/mach-at91/pm_suspend.S b/arch/arm/mach-at91/pm_suspend.S
+index e3ca77ae53fc..4521c020e289 100644
+--- a/arch/arm/mach-at91/pm_suspend.S
++++ b/arch/arm/mach-at91/pm_suspend.S
+@@ -174,6 +174,8 @@ sr_ena_2:
+ 	/* Disable DX DLLs for non-backup modes. */
+ 	cmp	r7, #AT91_PM_BACKUP
+ 	beq	sr_ena_3
++	cmp	r7, #AT91_PM_RESTORE
++	beq	sr_ena_3
+ 
+ 	/* Do not soft reset the AC DLL. */
+ 	ldr	tmp1, [r3, DDR3PHY_ACDLLCR]
+@@ -1061,7 +1063,7 @@ ulp_exit:
+ 	at91_mckx_ps_restore
+ .endm
+ 
+-.macro at91_backup_mode
++.macro at91_prepare_bsr
+ 	/* Switch the master clock source to slow clock. */
+ 	ldr	pmc, .pmc_base
+ 	ldr	tmp2, .mckr_offset
+@@ -1072,7 +1074,7 @@ ulp_exit:
+ 	mov	tmp3, #0
+ 	wait_mckrdy tmp3
+ 
+-	/*BUMEN*/
++	/* DDR I/Os retention */
+ 	ldr	r0, .sfrbu
+ 	mov	tmp1, #0x1
+ 	str	tmp1, [r0, #0x10]
+@@ -1081,6 +1083,10 @@ ulp_exit:
+ 1:	ldr	tmp1, [r0, #0x10]
+ 	tst	tmp1, #0x1
+ 	beq	1b
++.endm
++
++.macro at91_backup_mode
++	at91_prepare_bsr
+ 
+ 	/* Shutdown */
+ 	ldr	r0, .shdwc
+@@ -1090,6 +1096,22 @@ ulp_exit:
+ 	orr	tmp1, tmp1, #0x200000
+ #endif
+ 	str	tmp1, [r0, #0]
++	/* Dead loop */
++sd_loop:
++	b sd_loop
++.endm
++
++.macro at91_restore_mode
++	at91_prepare_bsr
++
++	/* Reset */
++	ldr	r0, .rstc
++	mov	tmp1, #0xA5000000
++	add	tmp1, tmp1, #0x1
++	str	tmp1, [r0, #0]
++	/* Dead loop */
++rst_loop:
++		b rst_loop
+ .endm
+ 
+ /*
+@@ -1119,6 +1141,9 @@ ENTRY(at91_pm_suspend_in_sram)
+ 	str	tmp1, .memtype
+ 	ldr	tmp1, [r0, #PM_DATA_MODE]
+ 	str	tmp1, .pm_mode
++snap_loop:
++	cmp	tmp1, #AT91_PM_SNAPSHOT
++	beq	snap_loop
+ #ifdef CONFIG_SOC_SAMA7
+ 	ldr	tmp1, [r0, #PM_DATA_PMC_MCK_COUNT]
+ 	str	tmp1, .mck_count
+@@ -1145,6 +1170,11 @@ ENTRY(at91_pm_suspend_in_sram)
+ 	cmp	tmp1, #0
+ 	ldrne	tmp2, [tmp1, #0]
+ 
++	ldr	tmp1, [r0, #PM_DATA_RSTC]
++	str	tmp1, .rstc
++	cmp	tmp1, #0
++	ldrne	tmp2, [tmp1, #0]
++
+ #ifndef CONFIG_SOC_SAM_V4_V5
+ 	/* ldrne below are here to preload their address in the TLB */
+ 	ldr	tmp1, [r0, #PM_DATA_RAMC_PHY]
+@@ -1171,6 +1201,8 @@ ENTRY(at91_pm_suspend_in_sram)
+ 	beq	standby
+ 	cmp	r0, #AT91_PM_BACKUP
+ 	beq	backup_mode
++	cmp	r0, #AT91_PM_RESTORE
++	beq	restore_mode
+ 
+ 	at91_ulp_mode
+ 	b	exit_suspend
+@@ -1184,6 +1216,9 @@ standby:
+ backup_mode:
+ 	at91_backup_mode
+ 
++restore_mode:
++	at91_restore_mode
++
+ exit_suspend:
+ 	/* Exit the self-refresh mode */
+ 	at91_sramc_self_refresh_dis
+@@ -1202,6 +1237,8 @@ ENDPROC(at91_pm_suspend_in_sram)
+ 	.word 0
+ .shdwc:
+ 	.word 0
++.rstc:
++	.word 0
+ .sfrbu:
+ 	.word 0
+ .memtype:
+diff --git a/drivers/clk/at91/pmc.c b/drivers/clk/at91/pmc.c
+index 63cbdfdc4d5c..50254aaccadd 100644
+--- a/drivers/clk/at91/pmc.c
++++ b/drivers/clk/at91/pmc.c
+@@ -119,12 +119,11 @@ static int at91_pmc_suspend(void)
+ {
+ 	unsigned int backup;
+ 
+-	if (!at91_pmc_backup_suspend)
+-		return 0;
+-
+-	backup = readl_relaxed(at91_pmc_backup_suspend);
+-	if (!backup)
+-		return 0;
++	if (at91_pmc_backup_suspend) {
++		backup = readl_relaxed(at91_pmc_backup_suspend);
++		if (!backup)
++			return 0;
++	}
+ 
+ 	return clk_save_context();
+ }
+@@ -133,12 +132,11 @@ static void at91_pmc_resume(void)
+ {
+ 	unsigned int backup;
+ 
+-	if (!at91_pmc_backup_suspend)
+-		return;
+-
+-	backup = readl_relaxed(at91_pmc_backup_suspend);
+-	if (!backup)
+-		return;
++	if (at91_pmc_backup_suspend) {
++		backup = readl_relaxed(at91_pmc_backup_suspend);
++		if (!backup)
++			return;
++	}
+ 
+ 	clk_restore_context();
+ }
+@@ -152,6 +150,8 @@ static const struct of_device_id pmc_dt_ids[] = {
+ 	{ .compatible = "atmel,sama5d2-pmc" },
+ 	{ .compatible = "microchip,sama7d65-pmc", },
+ 	{ .compatible = "microchip,sama7g5-pmc", },
++	{ .compatible = "microchip,sam9x7-pmc", },
++	{ .compatible = "microchip,sam9x60-pmc", },
+ 	{ /* sentinel */ }
+ };
+ 
+@@ -169,6 +169,12 @@ static int __init pmc_register_ops(void)
+ 	}
+ 	of_node_put(np);
+ 
++	if (of_device_is_compatible(np, "microchip,sam9x7-pmc") ||
++	    of_device_is_compatible(np, "microchip,sam9x60-pmc")) {
++		register_syscore_ops(&pmc_syscore_ops);
++		return 0;
++	}
++
+ 	np = of_find_compatible_node(NULL, NULL, "atmel,sama5d2-securam");
+ 	if (!np)
+ 		return -ENODEV;
+diff --git a/drivers/gpu/drm/microchip/mchp_gfx2d_drv.c b/drivers/gpu/drm/microchip/mchp_gfx2d_drv.c
+index 041df4cc0b84..88d4a5d38137 100644
+--- a/drivers/gpu/drm/microchip/mchp_gfx2d_drv.c
++++ b/drivers/gpu/drm/microchip/mchp_gfx2d_drv.c
+@@ -309,9 +309,55 @@ static int __maybe_unused mchp_gfx2d_runtime_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++static int __maybe_unused mchp_gfx2d_suspend(struct device *dev)
++{
++	struct mchp_gfx2d_device *priv = dev_get_drvdata(dev);
++
++	priv->pm_backup.base = readl(priv->regs + GFX2D_BASE);
++	priv->pm_backup.len = readl(priv->regs + GFX2D_LEN);
++
++	for (int i = 0; i < MCHP_GFX2D_MAX_SURFACES; i++) {
++		if (priv->surfaces[i])
++			mchp_gfx2d_gem_put(priv->surfaces[i]);
++
++		priv->surfaces[i] = NULL;
++	}
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static int __maybe_unused mchp_gfx2d_resume(struct device *dev)
++{
++	struct mchp_gfx2d_device *priv = dev_get_drvdata(dev);
++	int ret;
++
++	ret = pm_runtime_force_resume(dev);
++	if (ret)
++		return ret;
++
++	ret = clk_enable(priv->pclk);
++	if (ret) {
++		return ret;
++	}
++
++	writel(GFX2D_GD_DISABLE, priv->regs + GFX2D_GD);
++	writel(0, priv->regs + GFX2D_HEAD);
++	writel(0, priv->regs + GFX2D_TAIL);
++	writel(priv->pm_backup.base, priv->regs + GFX2D_BASE);
++	writel(priv->pm_backup.len, priv->regs + GFX2D_LEN);
++	writel(GFX2D_GE_ENABLE, priv->regs + GFX2D_GE);
++
++	priv->rb.data[0] = GFX2D_WD0_OPCODE(GFX2D_OPCODE_LDR) | GFX2D_WD0_REG(REG_GPREG5);
++	priv->rb.data[1] = (u32)priv->mbx_dma_addr;
++	priv->rb.head = 2;
++	writel(priv->rb.head, priv->regs + GFX2D_HEAD);
++
++	return 0;
++}
++
+ static const struct dev_pm_ops __maybe_unused mchp_gfx2d_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(mchp_gfx2d_runtime_suspend, mchp_gfx2d_runtime_resume, NULL)
+-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++	SET_SYSTEM_SLEEP_PM_OPS(mchp_gfx2d_suspend, mchp_gfx2d_resume)
+ };
+ 
+ static const struct mchp_gfx2d_caps mchp_sam9x60_gfx2d_caps = {
+diff --git a/drivers/gpu/drm/microchip/mchp_gfx2d_drv.h b/drivers/gpu/drm/microchip/mchp_gfx2d_drv.h
+index 21e83198d600..cdbd7c4798cd 100644
+--- a/drivers/gpu/drm/microchip/mchp_gfx2d_drv.h
++++ b/drivers/gpu/drm/microchip/mchp_gfx2d_drv.h
+@@ -72,6 +72,11 @@ struct mchp_gfx2d_device {
+ 	struct mchp_gfx2d_gem_object *surfaces[MCHP_GFX2D_MAX_SURFACES];
+ 
+ 	const struct mchp_gfx2d_caps *caps;
++
++	struct {
++		uint32_t base;
++		uint32_t len;
++	} pm_backup;
+ };
+ 
+ #define drm_to_dev(dev) container_of(dev, struct mchp_gfx2d_device, drm)
+diff --git a/drivers/irqchip/irq-atmel-aic5.c b/drivers/irqchip/irq-atmel-aic5.c
+index 03abbc28f46f..8916e11dcca5 100644
+--- a/drivers/irqchip/irq-atmel-aic5.c
++++ b/drivers/irqchip/irq-atmel-aic5.c
+@@ -403,6 +403,13 @@ IRQCHIP_DECLARE(sama5d4_aic5, "atmel,sama5d4-aic", sama5d4_aic5_of_init);
+ static int __init sam9x60_aic5_of_init(struct device_node *node,
+ 				       struct device_node *parent)
+ {
++#ifdef CONFIG_PM
++	smr_cache = kcalloc(DIV_ROUND_UP(NR_SAM9X60_IRQS, 32) * 32,
++			    sizeof(*smr_cache), GFP_KERNEL);
++	if (!smr_cache)
++		return -ENOMEM;
++#endif
++
+ 	return aic5_of_init(node, parent, NR_SAM9X60_IRQS);
+ }
+ IRQCHIP_DECLARE(sam9x60_aic5, "microchip,sam9x60-aic", sam9x60_aic5_of_init);
+@@ -412,6 +419,13 @@ IRQCHIP_DECLARE(sam9x60_aic5, "microchip,sam9x60-aic", sam9x60_aic5_of_init);
+ static int __init sam9x7_aic5_of_init(struct device_node *node,
+ 				      struct device_node *parent)
+ {
++#ifdef CONFIG_PM
++	smr_cache = kcalloc(DIV_ROUND_UP(NR_SAM9X7_IRQS, 32) * 32,
++			    sizeof(*smr_cache), GFP_KERNEL);
++	if (!smr_cache)
++		return -ENOMEM;
++#endif
++
+ 	return aic5_of_init(node, parent, NR_SAM9X7_IRQS);
+ }
+ IRQCHIP_DECLARE(sam9x7_aic5, "microchip,sam9x7-aic", sam9x7_aic5_of_init);
+diff --git a/drivers/mtd/nand/raw/atmel/nand-controller.c b/drivers/mtd/nand/raw/atmel/nand-controller.c
+index 6745355ff4c0..ee04ad2e9eca 100644
+--- a/drivers/mtd/nand/raw/atmel/nand-controller.c
++++ b/drivers/mtd/nand/raw/atmel/nand-controller.c
+@@ -204,6 +204,7 @@ struct atmel_nand_controller_ops {
+ 			       const struct nand_interface_config *conf);
+ 	int (*exec_op)(struct atmel_nand *nand,
+ 		       const struct nand_operation *op, bool check_only);
++	int (*resume)(struct atmel_nand_controller *nc);
+ };
+ 
+ struct atmel_nand_controller_caps {
+@@ -2407,6 +2408,20 @@ static int atmel_hsmc_nand_controller_probe(struct platform_device *pdev,
+ 	return ret;
+ }
+ 
++static int atmel_hsmc_nand_controller_resume(struct atmel_nand_controller *nc)
++{
++	struct atmel_hsmc_nand_controller *hsmc_nc =
++		to_hsmc_nand_controller(&nc->base);
++
++	regmap_write(hsmc_nc->base.smc, ATMEL_HSMC_NFC_IDR, 0xffffffff);
++	regmap_write(hsmc_nc->base.smc, ATMEL_HSMC_NFC_CFG,
++		     ATMEL_HSMC_NFC_CFG_DTO_MAX | hsmc_nc->cfg);
++	regmap_write(hsmc_nc->base.smc, ATMEL_HSMC_NFC_CTRL,
++		     ATMEL_HSMC_NFC_CTRL_EN);
++
++	return 0;
++}
++
+ static const struct atmel_nand_controller_ops atmel_hsmc_nc_ops = {
+ 	.probe = atmel_hsmc_nand_controller_probe,
+ 	.remove = atmel_hsmc_nand_controller_remove,
+@@ -2414,6 +2429,7 @@ static const struct atmel_nand_controller_ops atmel_hsmc_nc_ops = {
+ 	.nand_init = atmel_nand_init,
+ 	.setup_interface = atmel_hsmc_nand_setup_interface,
+ 	.exec_op = atmel_hsmc_nand_exec_op,
++	.resume = atmel_hsmc_nand_controller_resume,
+ };
+ 
+ static const struct atmel_nand_controller_caps atmel_sama5_nc_caps = {
+@@ -2659,6 +2675,10 @@ static __maybe_unused int atmel_nand_controller_resume(struct device *dev)
+ {
+ 	struct atmel_nand_controller *nc = dev_get_drvdata(dev);
+ 	struct atmel_nand *nand;
++	const struct atmel_nand_controller_ops *ops = nc->caps->ops;
++
++	if (ops->resume)
++		ops->resume(nc);
+ 
+ 	if (nc->pmecc)
+ 		atmel_pmecc_reset(nc->pmecc);
+diff --git a/drivers/pinctrl/pinctrl-at91.c b/drivers/pinctrl/pinctrl-at91.c
+index fbe74e4ef320..614a44f72126 100644
+--- a/drivers/pinctrl/pinctrl-at91.c
++++ b/drivers/pinctrl/pinctrl-at91.c
+@@ -45,7 +45,6 @@ struct at91_pinctrl_mux_ops;
+  * @clock: associated clock
+  * @ops: at91 pinctrl mux ops
+  * @wakeups: wakeup interrupts
+- * @backups: interrupts disabled in suspend
+  * @id: gpio chip identifier
+  */
+ struct at91_gpio_chip {
+@@ -58,8 +57,28 @@ struct at91_gpio_chip {
+ 	struct clk		*clock;
+ 	const struct at91_pinctrl_mux_ops *ops;
+ 	u32			wakeups;
+-	u32			backups;
+ 	u32			id;
++	struct {
++		u32		psr;
++		u32		osr;
++		u32		ifsr;
++		u32		odsr;
++		u32		imr;
++		u32		mdsr;
++		u32		pusr;
++		u32		abcdsr1;
++		u32		abcdsr2;
++		u32		ifscsr;
++		u32		scdr;
++		u32		ppdsr;
++		u32		owsr;
++		u32		aimmr;
++		u32		elsr;
++		u32		frlhsr;
++		u32		schmitt;
++		u32		slewr;
++		u32		driver1;
++	} pm_backup;
+ };
+ 
+ static struct at91_gpio_chip *gpio_chips[MAX_GPIO_BANKS];
+@@ -1658,8 +1677,29 @@ static int at91_gpio_suspend(struct device *dev)
+ 	struct at91_gpio_chip *at91_chip = dev_get_drvdata(dev);
+ 	void __iomem *pio = at91_chip->regbase;
+ 
+-	at91_chip->backups = readl_relaxed(pio + PIO_IMR);
+-	writel_relaxed(at91_chip->backups, pio + PIO_IDR);
++	at91_chip->pm_backup.psr     = readl_relaxed(pio + PIO_PSR);
++	at91_chip->pm_backup.osr     = readl_relaxed(pio + PIO_OSR);
++	at91_chip->pm_backup.ifsr    = readl_relaxed(pio + PIO_IFSR);
++	at91_chip->pm_backup.odsr    = readl_relaxed(pio + PIO_ODSR);
++	at91_chip->pm_backup.imr     = readl_relaxed(pio + PIO_IMR);
++	at91_chip->pm_backup.mdsr    = readl_relaxed(pio + PIO_MDSR);
++	at91_chip->pm_backup.pusr    = readl_relaxed(pio + PIO_PUSR);
++	at91_chip->pm_backup.abcdsr1 = readl_relaxed(pio + PIO_ABCDSR1);
++	at91_chip->pm_backup.abcdsr2 = readl_relaxed(pio + PIO_ABCDSR2);
++	at91_chip->pm_backup.ifscsr  = readl_relaxed(pio + PIO_IFSCSR);
++	at91_chip->pm_backup.scdr    = readl_relaxed(pio + PIO_SCDR);
++	at91_chip->pm_backup.ppdsr   = readl_relaxed(pio + PIO_PPDSR);
++	at91_chip->pm_backup.owsr    = readl_relaxed(pio + PIO_OWSR);
++	at91_chip->pm_backup.aimmr   = readl_relaxed(pio + PIO_AIMMR);
++	at91_chip->pm_backup.elsr    = readl_relaxed(pio + PIO_ELSR);
++	at91_chip->pm_backup.frlhsr  = readl_relaxed(pio + PIO_FRLHSR);
++	at91_chip->pm_backup.schmitt = readl_relaxed(pio + PIO_SCHMITT);
++#if defined(CONFIG_SOC_SAM9X60) || defined (CONFIG_SOC_SAM9X7)
++	at91_chip->pm_backup.slewr   = readl_relaxed(pio + SAM9X60_PIO_SLEWR);
++	at91_chip->pm_backup.driver1 = readl_relaxed(pio + SAM9X60_PIO_DRIVER1);
++#endif
++
++	writel_relaxed(at91_chip->pm_backup.imr, pio + PIO_IDR);
+ 	writel_relaxed(at91_chip->wakeups, pio + PIO_IER);
+ 
+ 	if (!at91_chip->wakeups)
+@@ -1679,8 +1719,44 @@ static int at91_gpio_resume(struct device *dev)
+ 	if (!at91_chip->wakeups)
+ 		clk_prepare_enable(at91_chip->clock);
+ 
++	/* Clear pending interrupts */
++	readl_relaxed(pio + PIO_ISR);
++
+ 	writel_relaxed(at91_chip->wakeups, pio + PIO_IDR);
+-	writel_relaxed(at91_chip->backups, pio + PIO_IER);
++	writel_relaxed(at91_chip->pm_backup.psr, pio + PIO_PER);
++	writel_relaxed(~at91_chip->pm_backup.psr, pio + PIO_PDR);
++	writel_relaxed(at91_chip->pm_backup.osr, pio + PIO_OER);
++	writel_relaxed(~at91_chip->pm_backup.osr, pio + PIO_ODR);
++	writel_relaxed(at91_chip->pm_backup.ifsr, pio + PIO_IFER);
++	writel_relaxed(~at91_chip->pm_backup.ifsr, pio + PIO_IFDR);
++	writel_relaxed(at91_chip->pm_backup.odsr, pio + PIO_SODR);
++	writel_relaxed(~at91_chip->pm_backup.odsr, pio + PIO_CODR);
++	writel_relaxed(at91_chip->pm_backup.imr, pio + PIO_IER);
++	writel_relaxed(~at91_chip->pm_backup.imr, pio + PIO_IDR);
++	writel_relaxed(at91_chip->pm_backup.mdsr, pio + PIO_MDER);
++	writel_relaxed(~at91_chip->pm_backup.mdsr, pio + PIO_MDDR);
++	writel_relaxed(at91_chip->pm_backup.pusr, pio + PIO_PUDR);
++	writel_relaxed(~at91_chip->pm_backup.pusr, pio + PIO_PUER);
++	writel_relaxed(at91_chip->pm_backup.abcdsr1, pio + PIO_ABCDSR1);
++	writel_relaxed(at91_chip->pm_backup.abcdsr2, pio + PIO_ABCDSR2);
++	writel_relaxed(at91_chip->pm_backup.ifscsr, pio + PIO_IFSCER);
++	writel_relaxed(~at91_chip->pm_backup.ifscsr, pio + PIO_IFSCDR);
++	writel_relaxed(at91_chip->pm_backup.scdr, pio + PIO_SCDR);
++	writel_relaxed(at91_chip->pm_backup.ppdsr, pio + PIO_PPDDR);
++	writel_relaxed(~at91_chip->pm_backup.ppdsr, pio + PIO_PPDER);
++	writel_relaxed(at91_chip->pm_backup.owsr, pio + PIO_OWER);
++	writel_relaxed(~at91_chip->pm_backup.owsr, pio + PIO_OWDR);
++	writel_relaxed(at91_chip->pm_backup.aimmr, pio + PIO_AIMER);
++	writel_relaxed(~at91_chip->pm_backup.aimmr, pio + PIO_AIMDR);
++	writel_relaxed(at91_chip->pm_backup.elsr, pio + PIO_LSR);
++	writel_relaxed(~at91_chip->pm_backup.elsr, pio + PIO_ESR);
++	writel_relaxed(at91_chip->pm_backup.frlhsr, pio + PIO_REHLSR);
++	writel_relaxed(~at91_chip->pm_backup.frlhsr, pio + PIO_FELLSR);
++	writel_relaxed(at91_chip->pm_backup.schmitt, pio + PIO_SCHMITT);
++#if defined(CONFIG_SOC_SAM9X60) || defined (CONFIG_SOC_SAM9X7)
++	writel_relaxed(at91_chip->pm_backup.slewr, pio + SAM9X60_PIO_SLEWR);
++	writel_relaxed(at91_chip->pm_backup.driver1, pio + SAM9X60_PIO_DRIVER1);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/drivers/regulator/mcp16502.c b/drivers/regulator/mcp16502.c
+index b34ae0bbba6f..fab17406ab03 100644
+--- a/drivers/regulator/mcp16502.c
++++ b/drivers/regulator/mcp16502.c
+@@ -68,6 +68,24 @@
+ #define MCP16502_EN BIT(7)
+ #define MCP16502_MODE BIT(6)
+ 
++#define MCP16502_REG_SYS_TMG	0x02
++#define MCP16502_PBTO_OFF		6
++#define MCP16502_PBTO_MASK		(0x3 << MCP16502_PBTO_OFF)
++#define MCP16502_PBTO_2S		(0x0 << MCP16502_PBTO_OFF)
++#define MCP16502_PBTO_4S		(0x1 << MCP16502_PBTO_OFF)
++#define MCP16502_PBTO_8S		(0x2 << MCP16502_PBTO_OFF)
++#define MCP16502_PBTO_16S		(0x3 << MCP16502_PBTO_OFF)
++#define MCP16502_PBINTTO_OFF	4
++#define MCP16502_PBINTTO_MASK	(0x3 << MCP16502_PBINTTO_OFF)
++#define MCP16502_PBINTTO_01S	(0x0 << MCP16502_PBINTTO_OFF)
++#define MCP16502_PBINTTO_05S	(0x1 << MCP16502_PBINTTO_OFF)
++#define MCP16502_PBINTTO_1S		(0x2 << MCP16502_PBINTTO_OFF)
++#define MCP16502_PBINTTO_2S		(0x3 << MCP16502_PBINTTO_OFF)
++
++#define MCP16502_REG_STS_SYS	0x04
++#define MCP16502_PBINT_OFF		5
++#define MCP16502_PBINT_MASK		(0x1 << MCP16502_PBINT_OFF)
++
+ #define MCP16502_MIN_REG 0x0
+ #define MCP16502_MAX_REG 0x65
+ 
+@@ -148,6 +166,9 @@ enum {
+  */
+ struct mcp16502 {
+ 	struct gpio_desc *lpm;
++	struct regmap *regmap;
++	struct work_struct work;
++	int irq;
+ };
+ 
+ /*
+@@ -157,6 +178,9 @@ struct mcp16502 {
+  */
+ static void mcp16502_gpio_set_mode(struct mcp16502 *mcp, int mode)
+ {
++	if (!mcp->lpm)
++		return;
++
+ 	switch (mode) {
+ 	case MCP16502_OPMODE_ACTIVE:
+ 		gpiod_set_value(mcp->lpm, 0);
+@@ -501,6 +525,35 @@ static const struct regmap_config mcp16502_regmap_config = {
+ 	.wr_table	= &mcp16502_yes_reg_table,
+ };
+ 
++static void mcp_worker(struct work_struct *work)
++{
++	lru_add_drain_all();
++	drop_slab();
++	pm_suspend(PM_SUSPEND_MEM);
++}
++
++static irqreturn_t mcp16502_interrupt(int irq, void *dev_id)
++{
++	struct i2c_client *client = dev_id;
++	struct mcp16502 *mcp = i2c_get_clientdata(client);
++	int ret;
++	unsigned int val;
++
++	ret = regmap_read(mcp->regmap, MCP16502_REG_STS_SYS, &val);
++	if (ret) {
++		dev_err(&client->dev, "failed to get PBINT ret = %d\n", ret);
++		return IRQ_HANDLED;
++	}
++
++	/* Do not suspend when kernel is initializing */
++	if (system_state >= SYSTEM_RUNNING) {
++		if (val & MCP16502_PBINT_MASK)
++			schedule_work(&mcp->work);
++	}
++
++	return IRQ_HANDLED;
++}
++
+ static int mcp16502_probe(struct i2c_client *client)
+ {
+ 	struct regulator_config config = { };
+@@ -525,6 +578,7 @@ static int mcp16502_probe(struct i2c_client *client)
+ 	}
+ 
+ 	i2c_set_clientdata(client, mcp);
++	mcp->regmap = rmap;
+ 	config.regmap = rmap;
+ 	config.driver_data = mcp;
+ 
+@@ -546,6 +600,35 @@ static int mcp16502_probe(struct i2c_client *client)
+ 
+ 	mcp16502_gpio_set_mode(mcp, MCP16502_OPMODE_ACTIVE);
+ 
++	if (device_property_read_bool(dev, "irq-capture-nstart")) {
++		if (client->irq < 0) {
++			dev_err(dev, "failed to get irq number: %d\n", client->irq);
++			return -EINVAL;
++		}
++
++		/* Read to reset the PBINT flag */
++		regmap_read(mcp->regmap, MCP16502_REG_STS_SYS, &i);
++		/*
++		 * Configure push button timeout,
++		 * t8 min. 2sec, t9 max. 2sec.
++		 */
++		ret = regmap_update_bits(mcp->regmap, MCP16502_REG_SYS_TMG,
++							MCP16502_PBTO_MASK | MCP16502_PBINTTO_MASK,
++							MCP16502_PBTO_2S | MCP16502_PBINTTO_2S);
++		if (ret)
++			return ret;
++
++		INIT_WORK(&mcp->work, mcp_worker);
++		ret = devm_request_threaded_irq(dev, client->irq, NULL,
++				mcp16502_interrupt, IRQF_ONESHOT,
++				dev_name(dev), client);
++		if (ret) {
++			dev_err(dev, "failed to request irq %d, ret %d\n",
++				client->irq, ret);
++			return ret;
++		}
++	}
++
+ 	return 0;
+ }
+ 
