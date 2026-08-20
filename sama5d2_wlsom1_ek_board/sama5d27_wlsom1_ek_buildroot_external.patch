@@ -1,0 +1,687 @@
+From f1552fe2632d0f4ea76e0935bc5241b4b96fb904 Mon Sep 17 00:00:00 2001
+From: murali k <murali@che-ld-i76461.microchip.com>
+Date: Fri, 24 Oct 2025 16:46:02 +0530
+Subject: [PATCH] Fixing rootfs remount issue buildroot external
+
+---
+ .../microchip/sama5d27_wlsom1_ek/genimage.cfg |  29 +-
+ .../sama5d27_wlsom1_ek/post_build.sh          |   1 +
+ .../sama5d27_wlsom1_ek/post_image_secure.sh   | 430 ++++++++++++++++++
+ .../sama5d27_wlsom1_ek/pre_build_genkeys.sh   |  11 +
+ board/microchip/sama5d27_wlsom1_ek/verity.cfg |   7 +
+ configs/sama5d27_wlsom1_ek_headless_defconfig |  50 +-
+ 6 files changed, 500 insertions(+), 28 deletions(-)
+ create mode 100755 board/microchip/sama5d27_wlsom1_ek/post_build.sh
+ create mode 100755 board/microchip/sama5d27_wlsom1_ek/post_image_secure.sh
+ create mode 100755 board/microchip/sama5d27_wlsom1_ek/pre_build_genkeys.sh
+ create mode 100644 board/microchip/sama5d27_wlsom1_ek/verity.cfg
+
+diff --git a/board/microchip/sama5d27_wlsom1_ek/genimage.cfg b/board/microchip/sama5d27_wlsom1_ek/genimage.cfg
+index d5e3c20..41eecd3 100644
+--- a/board/microchip/sama5d27_wlsom1_ek/genimage.cfg
++++ b/board/microchip/sama5d27_wlsom1_ek/genimage.cfg
+@@ -3,13 +3,21 @@
+ image boot.vfat {
+ 	vfat {
+ 		files = {
+-			"sama5d27_wlsom1_ek.itb",
+ 			"boot.bin",
+-			"u-boot.bin"
++			"u-boot.bin",
++			"wlsom1_secure.itb",
+ 		}
++	}
++
++	size = 32M
++}
+ 
+-		file uboot.env {
+-			image = "uboot-env.bin"
++image verity.vfat {
++	vfat {
++		files = {
++			"rootfs.verity",
++			"roothash.txt",
++			"roothash.txt.signed",
+ 		}
+ 	}
+ 	size = 16M
+@@ -28,6 +36,17 @@ image sdcard.img {
+ 
+ 	partition rootfs {
+ 		partition-type = 0x83
+-		image = "rootfs.ext4"
++		image = "rfs.enc"
++		size = 512M
++	}
++
++	partition verity {
++		partition-type = 0xC
++		image = "verity.vfat"
++	}
++
++	partition data {
++		partition-type = 0x83
++		image = "userdata.enc"
+ 	}
+ }
+diff --git a/board/microchip/sama5d27_wlsom1_ek/post_build.sh b/board/microchip/sama5d27_wlsom1_ek/post_build.sh
+new file mode 100755
+index 0000000..f1fa7ec
+--- /dev/null
++++ b/board/microchip/sama5d27_wlsom1_ek/post_build.sh
+@@ -0,0 +1 @@
++mkdir -p $TARGET_DIR/enc_userdata
+\ No newline at end of file
+diff --git a/board/microchip/sama5d27_wlsom1_ek/post_image_secure.sh b/board/microchip/sama5d27_wlsom1_ek/post_image_secure.sh
+new file mode 100755
+index 0000000..9569858
+--- /dev/null
++++ b/board/microchip/sama5d27_wlsom1_ek/post_image_secure.sh
+@@ -0,0 +1,430 @@
++#
++# post_image_secure.sh
++#
++
++echo "Securing images.."
++
++# enable tracing and exit on errors
++set -x -e
++
++# Define the ITS data
++ITS_DATA='
++/*Auto Generated*/
++/dts-v1/;
++
++/ {
++    description = "My FIT Image";
++    #address-cells = <1>;
++
++    images {
++	kernel {
++			description = "Linux4SAM Linux kernel";
++			data = /incbin/("./zImage");
++			type = "kernel";
++			arch = "arm";
++			os = "linux";
++			compression = "none";
++			load = <0x22000000>;
++			entry = <0x22000000>;
++			hash-1 {
++                algo = "sha256";
++            };
++        };
++
++        base_fdt {
++            description = "Flattened Device Tree blob";
++            data = /incbin/("./at91-sama5d27_wlsom1_ek.dtb");
++            type = "flat_dt";
++            arch = "arm";
++            compression = "none";
++            load = <0x21000000>;
++            hash-1 {
++                algo = "sha256";
++            };
++        };
++
++        ramdisk {
++            description = "Initramfs";
++            data = /incbin/("./rootfs.cpio");
++            type = "ramdisk";
++            arch = "arm";
++            os = "linux";
++            compression = "none";
++            load = <0x23000000>;
++            hash-1 {
++                algo = "sha256";
++            };
++        };
++        fdt_isc {
++		description = "Device Tree blob ISC overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_isc.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23100000>;
++		hash-1 {
++                algo = "sha256";
++            };
++	};
++
++	fdt_ov7670 {
++		description = "Device Tree blob Ov7670 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_ov7670.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23110000>;
++		hash-1 {
++                algo = "sha256";
++            };
++	};
++
++	fdt_ov7740 {
++		description = "Device Tree blob OV7740 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_ov7740.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23120000>;
++		hash-1 {
++                algo = "sha256";
++            };
++	};
++
++	fdt_pda4 {
++		description = "Device Tree blob pda4300 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_pda4.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23130000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_pda5 {
++		description = "Device Tree blob pda5000 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_pda5.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23140000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_pda7 {
++		description = "Device Tree blob pda7000 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_pda7.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23150000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_pda7b {
++		description = "Device Tree blob pda7000b overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_pda7b.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23160000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_ov5640 {
++		description = "Device Tree blob OV5640 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_ov5640.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23190000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_ptc {
++		description = "Device Tree blob PTC overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_ptc.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23170000>;
++		hash-1 {
++                algo = "sha256";
++            };
++
++	};
++
++	fdt_mt9v022 {
++		description = "Device Tree blob MT9V022 overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_mt9v022.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23200000>;
++		hash-1 {
++                algo = "sha256";
++            };
++	};
++
++	fdt_spi_click1 {
++		description = "Device Tree blob at25ff321a spi flash clickboard overlay";
++		data = /incbin/("./sama5d27_wlsom1_ek_at25ff321a_click1.dtbo");
++		type = "flat_dt";
++		arch = "arm";
++		compression = "none";
++		load = <0x23210000>;
++		hash-1 {
++                algo = "sha256";
++            };
++	};
++    };
++
++    configurations {
++        default = "kernel_dtb";
++
++        kernel_dtb {
++            description = "Linux kernel and base FDT blob for SAMA5D27_WLSOM1_EK board";
++            kernel = "kernel";
++            fdt = "base_fdt";
++            ramdisk = "ramdisk";
++            hash-1 {
++                algo = "sha256";
++            };
++             signature-1 {
++                algo = "sha256,rsa4096";
++                key-name-hint = "samkey";
++                sign-images = "fdt", "kernel", "ramdisk";
++            };
++        };
++
++        base_dtb {
++		description = "FDT blob for base SAMA5D27_WLSOM1_EK board";
++		fdt = "base_fdt";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	isc {
++		description = "FDT overlay blob for isc";
++		fdt = "fdt_isc";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	ov7670 {
++		description = "FDT overlay blob for ov7670 sensor";
++		fdt = "fdt_ov7670";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	ov7740 {
++		description = "FDT overlay blob for ov7740 sensor";
++		fdt = "fdt_ov7740";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	ov5640 {
++		description = "FDT overlay blob for ov5640 sensor";
++		fdt = "fdt_ov5640";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	mt9v022 {
++		description = "FDT overlay blob for mt9v022 sensor";
++		fdt = "fdt_mt9v022";
++		hash-1 {
++				algo = "sha256";
++			};
++				signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	pda4 {
++		description = "FDT overlay blob for PDA TM4300 screen";
++		fdt = "fdt_pda4";
++		hash-1 {
++				algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	pda5 {
++		description = "FDT overlay blob for PDA TM5000 screen";
++		fdt = "fdt_pda5";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	pda7 {
++		description = "FDT overlay blob for PDA TM7000 screen";
++		fdt = "fdt_pda7";
++		hash-1 {
++					algo = "sha256";
++				};
++				signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	pda7b {
++		description = "FDT overlay blob for PDA TM7000B screen";
++		fdt = "fdt_pda7b";
++		hash-1 {
++					algo = "sha256";
++				};
++				signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	ptc {
++		description = "FDT overlay blob for PTC";
++		fdt = "fdt_ptc";
++		hash-1 {
++				algo = "sha256";
++				};
++				signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++
++	spi_click1 {
++		description = "FDT overlay blob for at25ff321a spi flash clickboard (1)";
++		fdt = "fdt_spi_click1";
++		hash-1 {
++					algo = "sha256";
++				};
++			signature-1 {
++					algo = "sha256,rsa4096";
++					key-name-hint = "samkey";
++					sign-images = "fdt";
++				};
++	};
++    };
++};
++'
++
++echo "$ITS_DATA" > ${BINARIES_DIR}/wlsom1_secure.its
++
++cp ${BINARIES_DIR}/at91bootstrap.bin ${BINARIES_DIR}/boot.bin
++dd if=${BINARIES_DIR}/fde_key.bin of=${BINARIES_DIR}/boot.bin bs=1 conv=notrunc seek=$(($(stat --printf="%s" ${BINARIES_DIR}/boot.bin) - 512))
++
++veritysetup=${HOST_DIR}/sbin/veritysetup
++cryptsetup=${HOST_DIR}/sbin/cryptsetup
++mkfs=${HOST_DIR}/sbin/mkfs.ext4
++
++die() { echo "$@" >&2; exit 1; }
++
++test -x ${veritysetup} || \
++	die "No veritysetup found (host-cryptsetup has not been built?)"
++
++echo "# entering ${BINARIES_DIR} for this script"
++cd ${BINARIES_DIR}
++
++# Generate the hash table
++rm -f $rootfs.verity
++${veritysetup} format rootfs.ext4 rootfs.verity > rootfs.verity.header
++# Get the root hash
++ROOTHASH="$(awk '/Root hash:/ {print $3}' rootfs.verity.header)"
++
++echo ${ROOTHASH} | tr -d '\n' > roothash.txt
++# Sign the roothash
++if ! openssl smime -sign -nocerts -noattr -binary -in roothash.txt -inkey ${BINARIES_DIR}/verity_development_private.pem -signer ${BINARIES_DIR}/verity_development_cert.pem -outform der -out roothash.txt.signed; then
++    die "Failed to sign the root hash"
++fi
++
++# Encrypt the RFS
++# Create a 512M dummy file that will be mounted later as a encrypted RFS partition
++dd if=/dev/zero of=rfs.enc bs=1M count=512
++sync
++
++# Opening the file as an encrypted volume with they key specified is all that is needed
++sudo ${cryptsetup} -q -v --type plain --cipher aes-cbc-plain --key-file fde_key.bin open rfs.enc crypt
++# Copy the rfs image to create a encrypted rfs image
++sudo dd if=rootfs.ext4 of=/dev/mapper/crypt bs=4M
++sync
++# Lock and close
++sudo ${cryptsetup} close crypt
++
++# Create a 128M dummy file that will be mounted later as a persistent encrypted data partition
++dd if=/dev/zero of=userdata.enc bs=1M count=128
++sync
++# Opening the file as an encrypted volume with they key specified is all that is needed
++sudo ${cryptsetup} -q -v --type plain --cipher aes-cbc-plain --key-file fde_key.bin open userdata.enc crypt
++# Format the encrypted volume as a ext4 partition
++sudo ${mkfs} /dev/mapper/crypt
++# Lock and close
++sudo ${cryptsetup} close crypt
++sync
++
++#cp ${BINARIES_DIR}/image_signing.crt ${BINARIES_DIR}/samkey.crt
++#cp ${BINARIES_DIR}/image_signing.key ${BINARIES_DIR}/samkey.key
++
++mkimage -f ${BINARIES_DIR}/wlsom1_secure.its -r ${BINARIES_DIR}/wlsom1_secure.itb
+diff --git a/board/microchip/sama5d27_wlsom1_ek/pre_build_genkeys.sh b/board/microchip/sama5d27_wlsom1_ek/pre_build_genkeys.sh
+new file mode 100755
+index 0000000..b22d739
+--- /dev/null
++++ b/board/microchip/sama5d27_wlsom1_ek/pre_build_genkeys.sh
+@@ -0,0 +1,11 @@
++# Create keys if not present
++# Key for signing dm-verity roothash
++if [ ! -f ${BINARIES_DIR}/verity_development_private.pem ]; then
++	mkdir -p ${BINARIES_DIR}
++	openssl genpkey -algorithm RSA -out ${BINARIES_DIR}/verity_development_private.pem -pkeyopt rsa_keygen_bits:2048
++	openssl req -x509 -newkey rsa:1024 -keyout ${BINARIES_DIR}/verity_development_private.pem -out ${BINARIES_DIR}/verity_development_cert.pem -nodes -days 365 -set_serial 01 -subj /CN=example.com
++fi
++# Key for RFS encryption
++if [ ! -f ${BINARIES_DIR}/fde_key.bin ]; then
++	dd if=/dev/random of=${BINARIES_DIR}/fde_key.bin bs=512 count=1
++fi
+diff --git a/board/microchip/sama5d27_wlsom1_ek/verity.cfg b/board/microchip/sama5d27_wlsom1_ek/verity.cfg
+new file mode 100644
+index 0000000..f151c49
+--- /dev/null
++++ b/board/microchip/sama5d27_wlsom1_ek/verity.cfg
+@@ -0,0 +1,7 @@
++CONFIG_MD=y 
++CONFIG_BLK_DEV_DM=y 
++CONFIG_DM_CRYPT=y 
++CONFIG_DM_VERITY=y 
++CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG=y 
++CONFIG_DM_VERITY_FEC=y 
++CONFIG_SYSTEM_TRUSTED_KEYS="${BINARIES_DIR}/verity_development_cert.pem" 
+diff --git a/configs/sama5d27_wlsom1_ek_headless_defconfig b/configs/sama5d27_wlsom1_ek_headless_defconfig
+index 7559a51..650c38e 100644
+--- a/configs/sama5d27_wlsom1_ek_headless_defconfig
++++ b/configs/sama5d27_wlsom1_ek_headless_defconfig
+@@ -3,33 +3,34 @@ BR2_cortex_a5=y
+ BR2_ARM_ENABLE_NEON=y
+ BR2_ARM_ENABLE_VFP=y
+ BR2_ARM_INSTRUCTIONS_THUMB2=y
+-BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_MCHP_PATH)/patches"
+-BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+-BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_6=y
+ BR2_TOOLCHAIN_BUILDROOT_CXX=y
+ BR2_PACKAGE_HOST_GDB=y
+ BR2_PACKAGE_HOST_GDB_TUI=y
+ BR2_PACKAGE_HOST_GDB_PYTHON3=y
+ BR2_PACKAGE_HOST_GDB_SIM=y
++BR2_CCACHE=y
++BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_MCHP_PATH)/patches"
+ BR2_TARGET_GENERIC_HOSTNAME="sama5"
+ BR2_TARGET_GENERIC_ISSUE="Welcome to the Microchip SAMA5D27 Wireless SOM1 Evaluation Kit Demo"
+ BR2_ROOTFS_DEVICE_TABLE="$(BR2_EXTERNAL_MCHP_PATH)/system/device_table.txt"
+-BR2_CCACHE=y
+-BR2_SYSTEM_BIN_SH_BASH=y
++BR2_ROOTFS_MERGED_USR=y
++# BR2_TARGET_GENERIC_REMOUNT_ROOTFS_RW is not set
+ BR2_SYSTEM_DHCP="eth0"
+-BR2_INIT_SYSTEMD=y
+ BR2_SYSTEM_DEFAULT_PATH="/bin:/sbin:/usr/bin:/usr/sbin"
++BR2_TARGET_TZ_INFO=y
+ BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5/fs-overlay/ $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d2/fs-overlay/ $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/fs-overlay/"
+-BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/at91/post_build.sh $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5/post_build.sh"
+-BR2_ROOTFS_POST_IMAGE_SCRIPT="support/scripts/genimage.sh"
++BR2_ROOTFS_PRE_BUILD_SCRIPT="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/pre_build_genkeys.sh"
++BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/at91/post_build.sh $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5/post_build.sh $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/post_build.sh"
++BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/post_image_secure.sh support/scripts/genimage.sh"
+ BR2_ROOTFS_POST_SCRIPT_ARGS="-c $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/genimage.cfg"
+ BR2_LINUX_KERNEL=y
+ BR2_LINUX_KERNEL_CUSTOM_TARBALL=y
+ BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="$(call github,linux4microchip,linux,linux4microchip-2024.10)/linux-linux4microchip-2024.10.tar.gz"
+ BR2_LINUX_KERNEL_DEFCONFIG="sama5"
+-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5/sama5.fragment $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d2/sama5d2.fragment"
++BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/verity.cfg $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5/sama5.fragment $(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d2/sama5d2.fragment"
+ BR2_LINUX_KERNEL_DTS_SUPPORT=y
+ BR2_LINUX_KERNEL_INTREE_DTS_NAME="microchip/at91-sama5d27_wlsom1_ek"
++BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+ BR2_PACKAGE_LINUX_TOOLS_IIO=y
+ BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+ BR2_PACKAGE_MPG123=y
+@@ -52,13 +53,14 @@ BR2_PACKAGE_MTD=y
+ BR2_PACKAGE_NFS_UTILS=y
+ # BR2_PACKAGE_NFS_UTILS_RPC_NFSD is not set
+ BR2_PACKAGE_FB_TEST_APP=y
++BR2_PACKAGE_CRYPTSETUP=y
+ BR2_PACKAGE_EVTEST=y
+ BR2_PACKAGE_I2C_TOOLS=y
++BR2_PACKAGE_KBD=y
+ BR2_PACKAGE_RNG_TOOLS=y
+ # BR2_PACKAGE_RNG_TOOLS_JITTERENTROPY_LIBRARY is not set
+ BR2_PACKAGE_SETSERIAL=y
+ BR2_PACKAGE_SPI_TOOLS=y
+-BR2_PACKAGE_USBUTILS=y
+ BR2_PACKAGE_LUA=y
+ BR2_PACKAGE_NODEJS=y
+ BR2_PACKAGE_NODEJS_NPM=y
+@@ -76,12 +78,12 @@ BR2_PACKAGE_PYTHON_SPIDEV=y
+ BR2_PACKAGE_CA_CERTIFICATES=y
+ BR2_PACKAGE_GNUTLS=y
+ BR2_PACKAGE_GNUTLS_TOOLS=y
+-BR2_PACKAGE_LIBGPIOD=y
+-BR2_PACKAGE_LIBGPIOD_TOOLS=y
+ BR2_PACKAGE_LIBP11=y
+ BR2_PACKAGE_LIBOPENSSL_BIN=y
+ BR2_PACKAGE_LIBOPENSSL_ENGINES=y
+-BR2_PACKAGE_LIBINPUT=y
++BR2_PACKAGE_LIBGPIOD_TOOLS=y
++BR2_PACKAGE_LIBUSB=y
++BR2_PACKAGE_MTDEV=y
+ BR2_PACKAGE_CJSON=y
+ BR2_PACKAGE_LIBSECCOMP=y
+ BR2_PACKAGE_P11_KIT=y
+@@ -102,7 +104,6 @@ BR2_PACKAGE_DHCP_SERVER=y
+ BR2_PACKAGE_DHCP_SERVER_DELAYED_ACK=y
+ BR2_PACKAGE_DHCP_RELAY=y
+ BR2_PACKAGE_DHCPCD=y
+-# BR2_PACKAGE_DROPBEAR is not set
+ BR2_PACKAGE_ETHTOOL=y
+ BR2_PACKAGE_HOSTAPD=y
+ BR2_PACKAGE_HOSTAPD_EAP=y
+@@ -134,22 +135,27 @@ BR2_PACKAGE_WPA_SUPPLICANT_EAP=y
+ BR2_PACKAGE_WPA_SUPPLICANT_DEBUG_SYSLOG=y
+ BR2_PACKAGE_WPA_SUPPLICANT_WPS=y
+ BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+-BR2_PACKAGE_BASH=y
+ BR2_PACKAGE_BASH_COMPLETION=y
+ BR2_PACKAGE_FILE=y
++BR2_PACKAGE_NEOFETCH=y
+ BR2_PACKAGE_TIME=y
+ BR2_PACKAGE_WHICH=y
+ BR2_PACKAGE_ACL=y
++BR2_PACKAGE_HTOP=y
++BR2_PACKAGE_KMOD=y
++BR2_PACKAGE_KMOD_TOOLS=y
+ BR2_PACKAGE_TAR=y
+-BR2_PACKAGE_UTIL_LINUX_BINARIES=y
++BR2_PACKAGE_UTIL_LINUX_SULOGIN=y
+ BR2_PACKAGE_LESS=y
+ BR2_PACKAGE_NANO=y
+ BR2_PACKAGE_VIM=y
+-BR2_PACKAGE_HTOP=y
+-BR2_PACKAGE_NEOFETCH=y
++BR2_TARGET_ROOTFS_CPIO=y
++BR2_TARGET_ROOTFS_CPIO_DRACUT=y
++BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
+ BR2_TARGET_ROOTFS_EXT2=y
+ BR2_TARGET_ROOTFS_EXT2_4=y
+ BR2_TARGET_ROOTFS_EXT2_SIZE="512M"
++BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS="-b 4096 -O ^64bit"
+ BR2_TARGET_AT91BOOTSTRAP3=y
+ BR2_TARGET_AT91BOOTSTRAP3_CUSTOM_GIT=y
+ BR2_TARGET_AT91BOOTSTRAP3_CUSTOM_REPO_URL="https://github.com/linux4sam/at91bootstrap.git"
+@@ -162,14 +168,13 @@ BR2_TARGET_UBOOT_CUSTOM_REPO_URL="https://github.com/linux4microchip/u-boot-mchp
+ BR2_TARGET_UBOOT_CUSTOM_REPO_VERSION="linux4microchip-2024.10"
+ BR2_TARGET_UBOOT_BOARD_DEFCONFIG="sama5d27_wlsom1_ek_mmc"
+ BR2_TARGET_UBOOT_NEEDS_DTC=y
++BR2_PACKAGE_HOST_CRYPTSETUP=y
+ BR2_PACKAGE_HOST_DOSFSTOOLS=y
++BR2_PACKAGE_HOST_ENVIRONMENT_SETUP=y
+ BR2_PACKAGE_HOST_GENIMAGE=y
+ BR2_PACKAGE_HOST_MTOOLS=y
+-BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+ BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT=y
+-BR2_PACKAGE_HOST_UBOOT_TOOLS_ENVIMAGE=y
+-BR2_PACKAGE_HOST_UBOOT_TOOLS_ENVIMAGE_SOURCE="$(BR2_EXTERNAL_MCHP_PATH)/board/microchip/sama5d27_wlsom1_ek/uboot-env.txt"
+-BR2_PACKAGE_HOST_UBOOT_TOOLS_ENVIMAGE_SIZE="0x4000"
++BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT=y
+ BR2_PACKAGE_DT_OVERLAY_MCHP=y
+ BR2_PACKAGE_DT_OVERLAY_MCHP_PLATFORM="sama5d27_wlsom1_ek"
+ BR2_PACKAGE_PTC_EXAMPLES=y
+@@ -182,4 +187,3 @@ BR2_PACKAGE_WILCBTAPPS=y
+ BR2_PACKAGE_CRYPTOAUTHLIB=y
+ BR2_PACKAGE_CRYPTOAUTHLIB_SAMA5D27_WLSOM1_EK=y
+ BR2_PACKAGE_PYTHON_CRYPTOAUTHLIB=y
+-BR2_PACKAGE_HOST_ENVIRONMENT_SETUP=y
+-- 
+2.34.1
+

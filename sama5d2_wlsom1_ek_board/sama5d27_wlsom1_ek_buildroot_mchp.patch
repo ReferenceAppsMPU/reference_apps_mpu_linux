@@ -1,0 +1,241 @@
+diff --git a/boot/at91bootstrap3/0001-add-key-buffer-padding-space-for-fde.patch b/boot/at91bootstrap3/0001-add-key-buffer-padding-space-for-fde.patch
+new file mode 100644
+index 0000000000..026d9c5d96
+--- /dev/null
++++ b/boot/at91bootstrap3/0001-add-key-buffer-padding-space-for-fde.patch
+@@ -0,0 +1,64 @@
++diff --git a/configs/sama5d27_wlsom1_ek-bsrsd_uboot_defconfig b/configs/sama5d27_wlsom1_ek-bsrsd_uboot_defconfig
++index 327a66fd..05344565 100644
++--- a/configs/sama5d27_wlsom1_ek-bsrsd_uboot_defconfig
+++++ b/configs/sama5d27_wlsom1_ek-bsrsd_uboot_defconfig
++@@ -11,7 +11,6 @@ CONFIG_SDCARD=y
++ CONFIG_DEBUG=y
++ # CONFIG_ENTER_NWD is not set
++ # CONFIG_SDHC_8BIT_SUPPORT is not set
++-CONFIG_BACKUP_MODE=y
++ CONFIG_LED_ON_BOARD=y
++ CONFIG_LED_R_ON_PIOA=y
++ CONFIG_LED_R_PIN=6
++diff --git a/crt0_gnu.S b/crt0_gnu.S
++index 88ca1b7a..cd86369c 100644
++--- a/crt0_gnu.S
+++++ b/crt0_gnu.S
++@@ -39,6 +39,7 @@ _exception_vectors:
++ .word		_romsize	/* Size of the binary for ROMCode loading */
++	b 	irq_vector	/* IRQ : read the AIC */
++	b 	fiq_vector      /* FIQ */
+++.word		_fde_key_buffer_offset
++
++ undef_vector:
++	b 	undef_vector
++diff --git a/elf32-littlearm.lds b/elf32-littlearm.lds
++index 2088d57c..db3dc0df 100644
++--- a/elf32-littlearm.lds
+++++ b/elf32-littlearm.lds
++@@ -37,6 +37,14 @@ SECTIONS
++		*(.data)
++		_edata = .;
++	}
+++
+++	.fde_key_buffer : {
+++		. = ALIGN(4);
+++		_fde_key_buffer_start = .;
+++		KEEP(*(.fde_key_buffer))
+++		*(.fde_key_buffer)
+++		_edata = .;
+++	}
++
++	/* collect all uninitialized .bss sections */
++	.bss (NOLOAD) : {
++@@ -46,6 +54,7 @@ SECTIONS
++		_ebss = .;
++	}
++ }
+++_fde_key_buffer_offset = _fde_key_buffer_start - _stext;
++ _romsize = _edata - _stext;
++ _sramsize = _ebss - _stext;
++ end = .;  /* define a global symbol marking the end of application */
++diff --git a/main.c b/main.c
++index 01d57bde..0b73402e 100644
++--- a/main.c
+++++ b/main.c
++@@ -33,6 +33,8 @@ static void display_banner (void)
++ }
++ #endif
++
+++unsigned char _fde_key_buffer[512] __attribute__ ((section (".fde_key_buffer"))) = {0};
+++
++ int main(void)
++ {
++ #ifdef CONFIG_LOAD_SW
+diff --git a/boot/uboot/0001-uboot_security_config_updated_bootarg_bootcmd.patch b/boot/uboot/0001-uboot_security_config_updated_bootarg_bootcmd.patch
+new file mode 100644
+index 0000000000..d1355ee5bf
+--- /dev/null
++++ b/boot/uboot/0001-uboot_security_config_updated_bootarg_bootcmd.patch
+@@ -0,0 +1,56 @@
++diff --git a/configs/sama5d27_wlsom1_ek_mmc_defconfig b/configs/sama5d27_wlsom1_ek_mmc_defconfig
++index c3825a528d..d471e7b302 100644
++--- a/configs/sama5d27_wlsom1_ek_mmc_defconfig
+++++ b/configs/sama5d27_wlsom1_ek_mmc_defconfig
++@@ -11,6 +11,7 @@ CONFIG_ENV_SIZE=0x4000
++ CONFIG_DM_GPIO=y
++ CONFIG_DEFAULT_DEVICE_TREE="at91-sama5d27_wlsom1_ek"
++ CONFIG_OF_LIBFDT_OVERLAY=y
+++CONFIG_DM_RESET=y
++ CONFIG_SYS_MONITOR_LEN=524288
++ CONFIG_DEBUG_UART_BASE=0xf801c000
++ CONFIG_DEBUG_UART_CLOCK=82000000
++@@ -19,12 +20,13 @@ CONFIG_SYS_LOAD_ADDR=0x22000000
++ CONFIG_DEBUG_UART=y
++ CONFIG_ENV_VARS_UBOOT_CONFIG=y
++ CONFIG_FIT=y
+++CONFIG_SYS_BOOTM_LEN=0x1600000
++ CONFIG_SD_BOOT=y
++ CONFIG_BOOTDELAY=3
++ CONFIG_USE_BOOTARGS=y
++-CONFIG_BOOTARGS="console=ttyS0,115200 earlyprintk root=/dev/mmcblk0p2 rw rootwait"
+++CONFIG_BOOTARGS="console=ttyS0,115200 earlyprintk root=/dev/mmcblk0p2 rw rootwait dm_verity.require_signatures=1"
++ CONFIG_USE_BOOTCOMMAND=y
++-CONFIG_BOOTCOMMAND="if test ! -n ${dtb_name}; then setenv dtb_name at91-${board_name}.dtb; fi; fatload mmc 0:1 0x21000000 ${dtb_name}; fatload mmc 0:1 0x22000000 zImage; bootz 0x22000000 - 0x21000000"
+++CONFIG_BOOTCOMMAND="fatload mmc 0:1 0x24000000 wlsom1_secure.itb; setexpr fde_key_buffer *0x20; setenv bootargs $bootargs fde_key_addr=25000000; cp.b $fde_key_buffer 25000000 200; bootm 0x24000000"
++ CONFIG_SYS_CBSIZE=256
++ CONFIG_SYS_PBSIZE=276
++ # CONFIG_DISPLAY_BOARDINFO is not set
++@@ -42,12 +44,12 @@ CONFIG_CMD_DHCP=y
++ CONFIG_BOOTP_BOOTFILESIZE=y
++ CONFIG_CMD_MII=y
++ CONFIG_CMD_PING=y
+++CONFIG_CMD_AES=y
++ CONFIG_CMD_HASH=y
++ CONFIG_HASH_VERIFY=y
++ CONFIG_CMD_EXT4=y
++ CONFIG_CMD_FAT=y
++ CONFIG_OF_CONTROL=y
++-CONFIG_ENV_IS_IN_FAT=y
++ CONFIG_SYS_RELOC_GD_ENV_ADDR=y
++ CONFIG_CLK=y
++ CONFIG_CLK_CCF=y
++@@ -79,7 +81,6 @@ CONFIG_PHY_MICREL=y
++ CONFIG_MACB=y
++ CONFIG_PINCTRL=y
++ CONFIG_PINCTRL_AT91PIO4=y
++-CONFIG_DM_RESET=y
++ CONFIG_RESET_AT91=y
++ CONFIG_DM_SERIAL=y
++ CONFIG_DEBUG_UART_ANNOUNCE=y
++@@ -102,4 +103,5 @@ CONFIG_W1=y
++ CONFIG_W1_GPIO=y
++ CONFIG_W1_EEPROM=y
++ CONFIG_W1_EEPROM_DS24XXX=y
+++CONFIG_RSA=y
++ # CONFIG_EFI_LOADER_HII is not set
+diff --git a/fs/cpio/dracut.conf b/fs/cpio/dracut.conf
+index 2337736c4e..5a27b2aa9c 100644
+--- a/fs/cpio/dracut.conf
++++ b/fs/cpio/dracut.conf
+@@ -16,7 +16,10 @@ do_strip=no
+ # Dracut modules needed
+ add_dracutmodules+=" \
+ busybox-init
++crypt
++dm
+ "
++install_items+=" veritysetup cryptsetup "
+ 
+ # Modules to ignore
+ omit_dracutmodules+=" \
+@@ -27,12 +30,10 @@ bluetooth \
+ busybox \
+ caps \
+ cifs \
+-crypt \
+ crypt-gpg \
+ dash \
+ dbus-broker \
+ dbus-daemon \
+-dm \
+ dmraid \
+ dmsquash-live-ntfs \
+ dracut-systemd \
+diff --git a/fs/cpio/init b/fs/cpio/init
+index f74ef7e15f..300d2c6482 100755
+--- a/fs/cpio/init
++++ b/fs/cpio/init
+@@ -12,4 +12,75 @@ if (exec 0</dev/console) 2>/dev/null; then
+     exec 2>/dev/console
+ fi
+ 
+-exec /sbin/init "$@"
++mkdir -p /sys
++mkdir -p /run
++mkdir -p /proc
++mount -t sysfs sys /sys
++mount -t tmpfs tmpfs /run
++mount -t proc proc /proc
++
++#Wait for the mmc device to enumerate
++echo "Waiting for mmc device..."
++count=0
++while [ $count -lt 25 ]; do
++    test -b /dev/mmcblk0p3 && break
++    sleep 0.1
++    count=`expr $count + 1`
++done
++
++mkdir -p /run/verity_data
++mount -o ro /dev/mmcblk0p3 /run/verity_data
++
++# Extract the fde_key_addr from the kernel command line
++FDE_KEY_ADDR=$(cat /proc/cmdline | sed -n 's/.*fde_key_addr=\([^ ]*\).*/\1/p')
++
++# Validate that the address was found
++if [ -z "$FDE_KEY_ADDR" ]; then
++    echo "Error: fde_key_addr not provided in kernel command line."
++    exit 1
++fi
++
++echo "Using FDE_KEY_ADDR: 0x$FDE_KEY_ADDR"
++
++dd if=/dev/mem bs=1 of=key.bin skip=$((0x$FDE_KEY_ADDR)) count=512
++
++echo -n
++echo "Opening dm-crypt rfs volume"
++cryptsetup -q -v --type plain --cipher aes-cbc-plain --key-size 256 --key-file key.bin open /dev/mmcblk0p2 enc_rfs
++
++echo "Opening verity volume"
++[ ! -f /run/verity_data/rootfs.verity ] && echo "Missing Merkle tree file" && exit 1
++[ ! -f /run/verity_data/roothash.txt ] && echo "Missing root hash file" && exit 1
++[ ! -f /run/verity_data/roothash.txt.signed ] && echo "Missing signed root hash" && exit 1
++
++veritysetup --restart-on-corruption --ignore-zero-blocks \
++    open /dev/mapper/enc_rfs verity /run/verity_data/rootfs.verity \
++    --root-hash-signature=/run/verity_data/roothash.txt.signed \
++    --root-hash-file=/run/verity_data/roothash.txt \
++    && echo "Verity setup succeeded" \
++    || {
++        echo "Verity verification failed..hanging"
++        journalctl --identifier=veritysetup || true
++        exit 1
++    }
++
++echo "Mounting verity volume"
++mkdir -p /newroot
++mount /dev/mapper/verity /newroot
++mount -t devtmpfs devtmpfs /newroot/dev
++mount -t tmpfs tmpfs /newroot/tmp
++
++echo "Opening dm-crypt userdata volume"
++cryptsetup -q -v --type plain --cipher aes-cbc-plain --key-size 256 --key-file key.bin open /dev/mmcblk0p4 enc_userdata
++echo "Mounting user data volume"
++mount /dev/mapper/enc_userdata /newroot/enc_userdata
++chown -R 0:0 /newroot/enc_userdata
++
++echo "Erasing key.bin from RAM..."
++dd if=/dev/zero of=key.bin bs=512 count=1
++rm key.bin
++
++echo "[Initramfs]: Switching root..."
++exec switch_root /newroot /sbin/init "$@"
++
++#exec /sbin/init "$@"
